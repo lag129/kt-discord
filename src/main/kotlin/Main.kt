@@ -1,22 +1,34 @@
 package org.example
 
-import com.google.gson.FieldNamingPolicy
-import com.google.gson.GsonBuilder
+import com.github.kitakkun.ktvox.api.KtVoxApi
+import com.sedmelluq.discord.lavaplayer.player.AudioLoadResultHandler
+import com.sedmelluq.discord.lavaplayer.player.AudioPlayer
+import com.sedmelluq.discord.lavaplayer.player.AudioPlayerManager
+import com.sedmelluq.discord.lavaplayer.player.DefaultAudioPlayerManager
+import com.sedmelluq.discord.lavaplayer.player.event.AudioEvent
+import com.sedmelluq.discord.lavaplayer.player.event.AudioEventListener
+import com.sedmelluq.discord.lavaplayer.player.event.TrackEndEvent
+import com.sedmelluq.discord.lavaplayer.source.AudioSourceManagers
+import com.sedmelluq.discord.lavaplayer.tools.FriendlyException
+import com.sedmelluq.discord.lavaplayer.track.AudioPlaylist
+import com.sedmelluq.discord.lavaplayer.track.AudioTrack
+import com.sedmelluq.discord.lavaplayer.track.AudioTrackEndReason
+import com.sedmelluq.discord.lavaplayer.track.playback.AudioFrame
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import net.dv8tion.jda.api.JDABuilder
+import net.dv8tion.jda.api.audio.AudioSendHandler
 import net.dv8tion.jda.api.entities.Activity
+import net.dv8tion.jda.api.entities.Guild
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent
+import net.dv8tion.jda.api.events.message.MessageReceivedEvent
 import net.dv8tion.jda.api.hooks.ListenerAdapter
 import net.dv8tion.jda.api.interactions.commands.build.Commands
 import net.dv8tion.jda.api.requests.GatewayIntent
-import okhttp3.ResponseBody
-import retrofit2.Response
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.http.Body
-import retrofit2.http.POST
-import retrofit2.http.Query
+import java.io.File
+import java.nio.ByteBuffer
+import java.util.concurrent.LinkedBlockingQueue
 
 fun main() {
     val discordToken = System.getenv("DISCORD_TOKEN")
@@ -42,19 +54,25 @@ fun main() {
     } catch (e: Exception) {
         e.printStackTrace()
     }
-
-    val apiClient = ApiClient()
-    runBlocking {
-        launch {
-            val response = apiClient.audioQuery(1, "こんにちは")
-            println(response.body()?.string())
-            val response2 = apiClient.synthesis(1, response.body()?.string() ?: "")
-            println(response2.body()?.string())
-        }
-    }
 }
 
 class MyListener : ListenerAdapter() {
+    private val ktVoxApi = KtVoxApi.initialize("http://localhost:50031")
+    private val scope = CoroutineScope(Dispatchers.IO)
+    private val playerManager: AudioPlayerManager = DefaultAudioPlayerManager()
+    private val musicManagers = mutableMapOf<Long, GuildMusicManager>()
+    private val outputDir = File("./output")
+
+    init {
+        AudioSourceManagers.registerRemoteSources(playerManager)
+        AudioSourceManagers.registerLocalSource(playerManager)
+        outputDir.mkdirs()
+    }
+
+    private fun getGuildAudioPlayer(guild: Guild): GuildMusicManager {
+        return musicManagers.computeIfAbsent(guild.idLong) { GuildMusicManager(playerManager) }
+    }
+
     override fun onSlashCommandInteraction(event: SlashCommandInteractionEvent) {
         when (event.name) {
             "join" -> handleJoin(event)
@@ -63,13 +81,60 @@ class MyListener : ListenerAdapter() {
         }
     }
 
+    override fun onMessageReceived(event: MessageReceivedEvent) {
+        if (event.author.isBot) return
+
+        val guildAudioPlayer = getGuildAudioPlayer(event.guild)
+
+        scope.launch {
+            try {
+                val audioQuery = ktVoxApi.createAudioQuery(
+                    text = event.message.contentRaw,
+                    speaker = 0,
+                )
+                val generatedAudio = ktVoxApi.postSynthesis(
+                    speaker = 0,
+                    audioQuery = audioQuery,
+                )
+
+                val outputFile = File(outputDir, "${System.currentTimeMillis()}.wav")
+                outputFile.writeBytes(generatedAudio)
+
+                playerManager.loadItem(outputFile.absolutePath, object: AudioLoadResultHandler {
+                    override fun trackLoaded(track: AudioTrack) {
+                        guildAudioPlayer.scheduler.queue(track)
+                    }
+
+                    override fun playlistLoaded(playlist: AudioPlaylist) {
+                        playlist.tracks.forEach { guildAudioPlayer.scheduler.queue(it) }
+                    }
+
+                    override fun noMatches() {
+                        event.channel.sendMessage("❌再生する音声が見つかりませんでした。").queue()
+                    }
+
+                    override fun loadFailed(exception: FriendlyException) {
+                        event.channel.sendMessage("❌音声の読み込みに失敗しました。").queue()
+                    }
+                })
+
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
     private fun handleJoin(event: SlashCommandInteractionEvent) {
         checkUserInVoiceChannel(event)
         val audioManager = event.guild?.audioManager
         val voiceChannel = event.member?.voiceState?.channel
+
         try {
+            val guildAudioPlayer = event.guild?.let { getGuildAudioPlayer(it) }
+            audioManager?.sendingHandler = guildAudioPlayer?.getSendHandler()
             audioManager?.openAudioConnection(voiceChannel)
             event.reply("ボイスチャンネル「${voiceChannel?.name}」に接続しました！").setEphemeral(true).queue()
+
         } catch (e: Exception) {
             event.reply("❌ボイスチャンネルへの接続に失敗しました。").setEphemeral(true).queue()
             e.printStackTrace()
@@ -95,38 +160,59 @@ class MyListener : ListenerAdapter() {
     }
 }
 
-interface ApiService {
-    @POST("/audio_query")
-    suspend fun audioQuery(
-        @Query("speaker") speaker: Int,
-        @Body text: String
-    ): Response<ResponseBody>
+class GuildMusicManager(manager: AudioPlayerManager) {
+    val player: AudioPlayer = manager.createPlayer()
+    val scheduler = TrackScheduler(player)
 
-    @POST("/synthesis")
-    suspend fun synthesis(
-        @Query("speaker") speaker: Int,
-        @Body query: String
-    ): Response<ResponseBody>
+    init {
+        player.addListener(scheduler)
+        player.setFrameBufferDuration(500) // バッファ時間を増やす
+        player.volume = 80
+    }
+
+    fun getSendHandler(): AudioSendHandler = AudioPlayerSendHandler(player)
 }
 
-class ApiClient {
-    companion object {
-        private const val BASE_URL = "http://localhost:50031"
-    }
-    private val gson = GsonBuilder()
-        .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
-        .create()
-    private val retrofit = Retrofit.Builder()
-        .baseUrl(BASE_URL)
-        .addConverterFactory(GsonConverterFactory.create(gson))
-        .build()
-    private val apiService = retrofit.create(ApiService::class.java)
+class TrackScheduler(private val player: AudioPlayer) : AudioEventListener {
+    private val queue = LinkedBlockingQueue<AudioTrack>()
 
-    suspend fun audioQuery(speaker: Int, text: String): Response<ResponseBody> {
-        return apiService.audioQuery(speaker, text)
+    fun queue(track: AudioTrack) {
+        if (!player.startTrack(track, true)) {
+            queue.offer(track)
+        }
     }
 
-    suspend fun synthesis(speaker: Int, query: String): Response<ResponseBody> {
-        return apiService.synthesis(speaker, query)
+    fun nextTrack() {
+        player.startTrack(queue.poll(), false)
+    }
+
+    override fun onEvent(event: AudioEvent) {
+        if (event is TrackEndEvent) {
+            onTrackEnd(event.player, event.track, event.endReason)
+        }
+    }
+
+    private fun onTrackEnd(player: AudioPlayer, track: AudioTrack, endReason: AudioTrackEndReason) {
+        if (endReason.mayStartNext) {
+            nextTrack()
+        }
+    }
+}
+
+class AudioPlayerSendHandler(private val audioPlayer: AudioPlayer) : AudioSendHandler {
+    private var lastFrame: AudioFrame? = null
+
+    override fun canProvide(): Boolean {
+        lastFrame = audioPlayer.provide()
+        return lastFrame != null
+    }
+
+    override fun provide20MsAudio(): ByteBuffer? {
+        val data = lastFrame?.data ?: return null
+        return ByteBuffer.wrap(data)
+    }
+
+    override fun isOpus(): Boolean {
+        return true
     }
 }
