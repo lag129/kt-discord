@@ -1,11 +1,22 @@
 package org.example
 
+import com.google.gson.FieldNamingPolicy
+import com.google.gson.GsonBuilder
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import net.dv8tion.jda.api.JDABuilder
 import net.dv8tion.jda.api.entities.Activity
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent
 import net.dv8tion.jda.api.hooks.ListenerAdapter
 import net.dv8tion.jda.api.interactions.commands.build.Commands
 import net.dv8tion.jda.api.requests.GatewayIntent
+import okhttp3.ResponseBody
+import retrofit2.Response
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.Body
+import retrofit2.http.POST
+import retrofit2.http.Query
 
 fun main() {
     val discordToken = System.getenv("DISCORD_TOKEN")
@@ -30,6 +41,16 @@ fun main() {
 
     } catch (e: Exception) {
         e.printStackTrace()
+    }
+
+    val apiClient = ApiClient()
+    runBlocking {
+        launch {
+            val response = apiClient.audioQuery(1, "こんにちは")
+            println(response.body()?.string())
+            val response2 = apiClient.synthesis(1, response.body()?.string() ?: "")
+            println(response2.body()?.string())
+        }
     }
 }
 
@@ -71,5 +92,41 @@ class MyListener : ListenerAdapter() {
             event.reply("❌️ボイスチャンネルに参加していません。").setEphemeral(true).queue()
             throw Exception("ボイスチャンネルに参加していません。")
         }
+    }
+}
+
+interface ApiService {
+    @POST("/audio_query")
+    suspend fun audioQuery(
+        @Query("speaker") speaker: Int,
+        @Body text: String
+    ): Response<ResponseBody>
+
+    @POST("/synthesis")
+    suspend fun synthesis(
+        @Query("speaker") speaker: Int,
+        @Body query: String
+    ): Response<ResponseBody>
+}
+
+class ApiClient {
+    companion object {
+        private const val BASE_URL = "http://localhost:50031"
+    }
+    private val gson = GsonBuilder()
+        .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
+        .create()
+    private val retrofit = Retrofit.Builder()
+        .baseUrl(BASE_URL)
+        .addConverterFactory(GsonConverterFactory.create(gson))
+        .build()
+    private val apiService = retrofit.create(ApiService::class.java)
+
+    suspend fun audioQuery(speaker: Int, text: String): Response<ResponseBody> {
+        return apiService.audioQuery(speaker, text)
+    }
+
+    suspend fun synthesis(speaker: Int, query: String): Response<ResponseBody> {
+        return apiService.synthesis(speaker, query)
     }
 }
