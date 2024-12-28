@@ -62,6 +62,7 @@ class MyListener : ListenerAdapter() {
     private val playerManager: AudioPlayerManager = DefaultAudioPlayerManager()
     private val musicManagers = mutableMapOf<Long, GuildMusicManager>()
     private val outputDir = File("./output")
+    private var joinedChannel = ""
 
     init {
         AudioSourceManagers.registerRemoteSources(playerManager)
@@ -83,6 +84,16 @@ class MyListener : ListenerAdapter() {
 
     override fun onMessageReceived(event: MessageReceivedEvent) {
         if (event.author.isBot) return
+
+        if (event.message.contentRaw.startsWith("!join")) {
+            handleJoin(event)
+            joinedChannel = event.message.channelId
+        }
+
+        if (joinedChannel.isEmpty()) return
+        if (joinedChannel != event.message.channelId) return
+
+        event.member?.voiceState?.channel ?: return
 
         val guildAudioPlayer = getGuildAudioPlayer(event.guild)
 
@@ -117,7 +128,6 @@ class MyListener : ListenerAdapter() {
                         event.channel.sendMessage("❌音声の読み込みに失敗しました。").queue()
                     }
                 })
-
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -141,10 +151,30 @@ class MyListener : ListenerAdapter() {
         }
     }
 
+    private fun handleJoin(event: MessageReceivedEvent) {
+//        checkUserInVoiceChannel(event)
+        val audioManager = event.guild.audioManager
+        val voiceChannel = event.member?.voiceState?.channel
+
+        try {
+            val guildAudioPlayer = getGuildAudioPlayer(event.guild)
+            audioManager.sendingHandler = guildAudioPlayer.getSendHandler()
+            audioManager.openAudioConnection(voiceChannel)
+//            event.reply("ボイスチャンネル「${voiceChannel?.name}」に接続しました！").setEphemeral(true).queue()
+
+        } catch (e: Exception) {
+//            event.reply("❌ボイスチャンネルへの接続に失敗しました。").setEphemeral(true).queue()
+            e.printStackTrace()
+        }
+    }
+
     private fun handleLeave(event: SlashCommandInteractionEvent) {
         checkUserInVoiceChannel(event)
         val audioManager = event.guild?.audioManager
         audioManager?.closeAudioConnection()
+        joinedChannel = ""
+        val dir = File("./output")
+        dir.listFiles()?.forEach { it.delete() }
         event.reply("ボイスチャンネルから切断しました！").setEphemeral(true).queue()
     }
 
@@ -161,13 +191,13 @@ class MyListener : ListenerAdapter() {
 }
 
 class GuildMusicManager(manager: AudioPlayerManager) {
-    val player: AudioPlayer = manager.createPlayer()
+    private val player: AudioPlayer = manager.createPlayer()
     val scheduler = TrackScheduler(player)
 
     init {
         player.addListener(scheduler)
         player.setFrameBufferDuration(500) // バッファ時間を増やす
-        player.volume = 80
+        player.volume = 30
     }
 
     fun getSendHandler(): AudioSendHandler = AudioPlayerSendHandler(player)
@@ -182,7 +212,7 @@ class TrackScheduler(private val player: AudioPlayer) : AudioEventListener {
         }
     }
 
-    fun nextTrack() {
+    private fun nextTrack() {
         player.startTrack(queue.poll(), false)
     }
 
