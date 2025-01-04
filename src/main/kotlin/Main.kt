@@ -49,7 +49,7 @@ fun main() {
             Commands.slash("leave", "読み上げボットをボイスチャンネルから切断します。"),
             Commands.slash("help", "ヘルプを表示します。")
         )
-        guild.updateCommands().addCommands(commands).queue()
+        jda.updateCommands().addCommands(commands).queue()
 
     } catch (e: Exception) {
         e.printStackTrace()
